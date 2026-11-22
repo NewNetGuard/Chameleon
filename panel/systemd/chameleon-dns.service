@@ -1,0 +1,52 @@
+# Copyright (c) 2026 NewNetGuard
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[Unit]
+Description=Chameleon fail-closed DNS for covered devices
+After=network-online.target chameleon-guard.service
+Wants=network-online.target
+Requires=chameleon-guard.service
+
+[Service]
+Type=simple
+User=chameleon-dns
+Group=chameleon-dns
+WorkingDirectory=/
+Environment="PATH=/usr/bin:/bin"
+ExecStart=/usr/bin/python3 /usr/lib/chameleon/chameleon_dns.py
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @reboot @swap @privileged
+RestrictAddressFamilies=AF_INET AF_UNIX
+MemoryMax=64M
+TasksMax=64
+LimitNOFILE=1024
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chameleon-dns
+
+[Install]
+WantedBy=multi-user.target

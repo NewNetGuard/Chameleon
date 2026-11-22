@@ -1,0 +1,1096 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 NewNetGuard
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+#
+# chameleon-netctl: network control of the Chameleon Panel. Runner-invoked (root).
+#
+# Routes all internet traffic of THIS device through the Chameleon tunnel
+# (REALITY + uTLS, masquerading as a browser). The headless client daemon
+# (chameleon-client) owns the cham0 TUN; this script runs it and wires:
+#   - policy routing: everything into table 51821 (cham0, blackhole behind it),
+#     except the client's own connection to the server, the panel's link to
+#     its server, and the local network;
+#   - a kill switch: this device sends nothing to the internet except through
+#     the tunnel, also while the tunnel starts or after it fails;
+#   - fail-closed DNS: every DNS query goes to a local resolver that reaches
+#     the internet only through cham0;
+#   - TCP streams: TCP is carried as separate streams when the server offers
+#     them (transparent listener in a small network namespace).
+#
+# Subcommands:
+#   up <src_conf> [block_quic]   start or restart the tunnel
+#   guard                        install the persisted fail-closed rules at boot
+#   resume                       restore an enabled tunnel at boot
+#   down                         stop the tunnel and remove every rule
+#   status                       JSON
+#
+set -uo pipefail
+
+IF="cham0"
+TCP_STREAM_IF="chtcp0"
+TCP_STREAM_NS="chameleon-chtcp"
+TCP_STREAM_NS_IF="chtcp1"
+TCP_STREAM_HOST_IP="169.254.77.1"
+TCP_STREAM_NS_IP="169.254.77.2"
+TCP_STREAM_PORT="15080"
+TCP_STREAM_TABLE="51824"
+TCP_STREAM_SOCKET="chameleon-tcp.socket"
+CHAM_BIN="/opt/chameleon/bin/chameleon-client"
+SOURCE_CONF="/var/lib/chameleon-panel/stealth_client.conf"
+RUNTIME_DIR="/run/chameleon"
+SAFE_CONF="$RUNTIME_DIR/client.conf"
+STATE="$RUNTIME_DIR/state.env"
+STATUS_DIR="$RUNTIME_DIR/status"
+STATUS_FILE="$STATUS_DIR/status.json"
+POLICY_DIR="/var/lib/chameleon/policy"
+DNS_POLICY_FILE="$POLICY_DIR/dns-policy.json"
+LOG="/var/log/chameleon/client.log"
+CHAM_SERVICE="chameleon-client.service"
+CHAM_UNIT="/run/systemd/system/$CHAM_SERVICE"
+TCP_STREAM_SOCKET_UNIT="/run/systemd/system/$TCP_STREAM_SOCKET"
+STEALTH_SCRIPT="/usr/lib/chameleon/chameleon-netctl"
+CHAM_USER="chameleon-client"
+CHAM_GROUP="chameleon-client"
+DNS_PROXY_USER="chameleon-dns"
+DNS_PROXY_GROUP="chameleon-dns"
+DNS_PROXY_SERVICE="chameleon-dns.service"
+DNS_PROXY_PORT="15353"   # the local resolver every DNS query is redirected to
+PANEL_USER="chameleon"
+PANEL_GROUP="chameleon"
+RT_TABLE="51821"
+DNS_RT_TABLE="51823"
+HOST_CHAIN="CHAMELEON_HOST"       # kill switch, IPv4 OUTPUT
+HOST6_CHAIN="CHAMELEON_HOST6"     # kill switch, IPv6 OUTPUT
+QUIC_CHAIN="CHAMELEON_QUIC"
+DNS_EGRESS_CHAIN="CHAMELEON_DNS_EGRESS"
+DNS_REDIRECT_CHAIN="CHAMELEON_DNS_REDIRECT"
+# ip rule priorities, lowest first
+CLIENT_PREF="5080"            # the client's own traffic: ordinary uplink
+PANEL_PREF="5081"             # the panel's SSH/HTTPS to its server: ordinary uplink
+DNS_PROXY_STAGING_PREF="5082" # keeps the resolver fail-closed while its rule is replaced
+DNS_PROXY_PREF="5083"         # the resolver: cham0 only, blackhole otherwise
+TAILSCALE_PREF="5089"         # Tailscale routes live in its policy table
+MGMT_PREF="5090"              # local network: always direct
+TCP_STREAM_VPS_PREF="5091"    # TCP to the server itself keeps the packet tunnel
+TCP_STREAM_PREF="5092"        # TCP to the stream table; empty table falls through
+HOST_PREF="5096"              # everything else: the tunnel table
+
+initialize_runtime_paths() {
+  if getent group "$CHAM_GROUP" >/dev/null 2>&1; then
+    install -d -o root -g "$CHAM_GROUP" -m 0750 "$RUNTIME_DIR"
+  else
+    install -d -o root -g root -m 0700 "$RUNTIME_DIR"
+  fi
+  install -d -o root -g root -m 0755 /var/lib/chameleon
+  install -d -o root -g "$PANEL_GROUP" -m 0750 "$(dirname "$LOG")"
+  [[ ! -L "$POLICY_DIR" ]] || { echo "Refusing symlink policy directory: $POLICY_DIR" >&2; return 1; }
+  install -d -o root -g root -m 0750 "$POLICY_DIR" || return 1
+  [[ ! -L "$LOG" ]] || { echo "Refusing symlink log file: $LOG" >&2; return 1; }
+  touch "$LOG" || return 1
+  chown root:"$PANEL_GROUP" "$LOG" || return 1
+  chmod 0640 "$LOG" || return 1
+}
+
+json() { printf '%s\n' "$1"; }
+jesc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+err()  { json "{\"success\":false,\"error\":\"$(jesc "$1")\"}"; exit 1; }
+temporary_err() {
+  json "{\"success\":false,\"failure_code\":\"server_unavailable\",\"error\":\"$(jesc "$1")\"}"
+  exit 75
+}
+
+tune_tcp_transport() {
+  # Chameleon carries this device's traffic over one long-lived TCP connection.
+  # Large autotuning ceilings avoid starving that carrier, while BBR prevents
+  # one loss/reordering event from collapsing throughput for every inner flow.
+  # Every setting is best-effort so an older kernel can still run Chameleon.
+  sysctl -q -w net.core.rmem_max=67108864 >/dev/null 2>&1 || true
+  sysctl -q -w net.core.wmem_max=67108864 >/dev/null 2>&1 || true
+  sysctl -q -w 'net.ipv4.tcp_rmem=4096 87380 67108864' >/dev/null 2>&1 || true
+  sysctl -q -w 'net.ipv4.tcp_wmem=4096 65536 67108864' >/dev/null 2>&1 || true
+  if modprobe tcp_bbr >/dev/null 2>&1; then
+    sysctl -q -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -q -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+  fi
+}
+
+output_jump_present() {
+  # $1=iptables|ip6tables $2=chain: OUTPUT jumps to the chain.
+  "$1" -C OUTPUT -j "$2" 2>/dev/null
+}
+
+resolve_host_ip() { # host (name OR literal IP) -> IPv4
+  local h="${1:-}"; [[ -z "$h" ]] && return
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then printf '%s' "$h"; return; fi
+  getent ahostsv4 "$h" 2>/dev/null | awk '{print $1; exit}'
+}
+
+cham_server_ip() { # parse "server_address":"host:port" from the JSON config
+  local host route_ip
+  route_ip=$(grep -oE '"server_route_ip"[[:space:]]*:[[:space:]]*"[0-9.]+"' "$1" | head -1 \
+    | sed -E 's/.*:[[:space:]]*"([0-9.]+)".*/\1/')
+  if [[ "$route_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s' "$route_ip"
+    return
+  fi
+  host=$(grep -oE '"server_address"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" | head -1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/; s/:[0-9]+$//')
+  resolve_host_ip "$host"
+}
+
+validate_ip_csv() {
+  /usr/bin/python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+value = sys.argv[1]
+if not value:
+    raise SystemExit(0)
+items = value.split(",")
+if len(items) > 256:
+    raise SystemExit(1)
+for item in items:
+    address = ipaddress.ip_address(item)
+    if address.version != 4 or address.is_unspecified or address.is_multicast:
+        raise SystemExit(1)
+PY
+}
+
+ensure_dns_proxy_identity() {
+  if ! getent group "$DNS_PROXY_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$DNS_PROXY_GROUP" || return 1
+  fi
+  if id -u "$DNS_PROXY_USER" >/dev/null 2>&1; then
+    [[ "$(id -gn "$DNS_PROXY_USER" 2>/dev/null)" == "$DNS_PROXY_GROUP" ]] || return 1
+    [[ "$(id -nG "$DNS_PROXY_USER" 2>/dev/null)" == "$DNS_PROXY_GROUP" ]] || return 1
+    local account_shell
+    account_shell="$(getent passwd "$DNS_PROXY_USER" | cut -d: -f7)"
+    [[ "$account_shell" == "/usr/sbin/nologin" || "$account_shell" == "/sbin/nologin" ]] \
+      || return 1
+  else
+    useradd --system --gid "$DNS_PROXY_GROUP" --home-dir /nonexistent --no-create-home \
+      --shell /usr/sbin/nologin "$DNS_PROXY_USER" || return 1
+  fi
+}
+
+install_dns_egress_guard() {
+  local dns_uid="$1"
+  iptables -N "$DNS_EGRESS_CHAIN" 2>/dev/null || true
+  # Build monotonically: install the deny rule before exposing the chain, then
+  # insert narrow allows ahead of it. Never flush a live chain and create a gap.
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" \
+    -j REJECT --reject-with icmp-port-unreachable 2>/dev/null \
+    || iptables -A "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" \
+      -j REJECT --reject-with icmp-port-unreachable || return 1
+  iptables -C OUTPUT -j "$DNS_EGRESS_CHAIN" 2>/dev/null \
+    || iptables -I OUTPUT 1 -j "$DNS_EGRESS_CHAIN" || return 1
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" -o lo -j ACCEPT \
+    2>/dev/null || iptables -I "$DNS_EGRESS_CHAIN" 1 -m owner \
+      --uid-owner "$dns_uid" -o lo -j ACCEPT || return 1
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" -o "$IF" \
+    -p udp --dport 53 -j ACCEPT 2>/dev/null \
+    || iptables -I "$DNS_EGRESS_CHAIN" 1 -m owner --uid-owner "$dns_uid" \
+      -o "$IF" -p udp --dport 53 -j ACCEPT || return 1
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" -o "$IF" \
+    -p tcp --dport 53 -j ACCEPT 2>/dev/null \
+    || iptables -I "$DNS_EGRESS_CHAIN" 1 -m owner --uid-owner "$dns_uid" \
+      -o "$IF" -p tcp --dport 53 -j ACCEPT || return 1
+}
+
+clear_dns_egress_guard() {
+  while iptables -D OUTPUT -j "$DNS_EGRESS_CHAIN" 2>/dev/null; do :; done
+  iptables -F "$DNS_EGRESS_CHAIN" 2>/dev/null || true
+  iptables -X "$DNS_EGRESS_CHAIN" 2>/dev/null || true
+}
+
+strict_dns_guard_active() {
+  local dns_uid accepts rule_count last_rule
+  dns_uid="$(id -u "$DNS_PROXY_USER" 2>/dev/null)" || return 1
+  ip rule show 2>/dev/null \
+    | grep -E "^[[:space:]]*${DNS_PROXY_PREF}:.*uidrange ${dns_uid}-${dns_uid}.*lookup ${DNS_RT_TABLE}([[:space:]]|$)" >/dev/null \
+    || return 1
+  ip route show table "$DNS_RT_TABLE" 2>/dev/null | grep '^blackhole default' >/dev/null \
+    || return 1
+  output_jump_present iptables "$DNS_EGRESS_CHAIN" || return 1
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" -o lo \
+    -j ACCEPT 2>/dev/null || return 1
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" -o "$IF" \
+    -p udp --dport 53 -j ACCEPT 2>/dev/null || return 1
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" -o "$IF" \
+    -p tcp --dport 53 -j ACCEPT 2>/dev/null || return 1
+  iptables -C "$DNS_EGRESS_CHAIN" -m owner --uid-owner "$dns_uid" \
+    -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || return 1
+  accepts="$(iptables -S "$DNS_EGRESS_CHAIN" 2>/dev/null | grep -c -- '-j ACCEPT$')" \
+    || true
+  [[ "$accepts" == "3" ]] || return 1
+  rule_count="$(iptables -S "$DNS_EGRESS_CHAIN" 2>/dev/null | grep -c -- '^-A ')" \
+    || true
+  [[ "$rule_count" == "4" ]] || return 1
+  last_rule="$(iptables -S "$DNS_EGRESS_CHAIN" 2>/dev/null | tail -n1)"
+  [[ "$last_rule" == *"--uid-owner $dns_uid"* \
+     && "$last_rule" == *"-j REJECT --reject-with icmp-port-unreachable" ]]
+}
+
+prepare_client_config() {
+  SOURCE_CONF="$1" SAFE_CONF="$SAFE_CONF" \
+    STATUS_FILE="$STATUS_FILE" CHAM_GROUP="$CHAM_GROUP" \
+    TCP_STREAM_TABLE="$TCP_STREAM_TABLE" TCP_STREAM_NS_IP="$TCP_STREAM_NS_IP" \
+    TCP_STREAM_IF="$TCP_STREAM_IF" \
+    /usr/bin/python3 - <<'PY'
+import grp
+import ipaddress
+import json
+import os
+import re
+import socket
+import stat
+import tempfile
+import urllib.parse
+
+source = os.environ["SOURCE_CONF"]
+destination = os.environ["SAFE_CONF"]
+status_file = os.environ["STATUS_FILE"]
+
+def valid_host(value):
+    if not value or len(value) > 253 or any(ord(char) < 33 for char in value):
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    try:
+        ascii_host = value.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    labels = ascii_host.rstrip(".").split(".")
+    return bool(labels) and all(
+        re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    )
+
+def endpoint(value):
+    if not isinstance(value, str) or len(value) > 320:
+        raise ValueError("invalid endpoint")
+    parsed = urllib.parse.urlsplit("//" + value)
+    if parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+        raise ValueError("invalid endpoint")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid endpoint port") from exc
+    if not valid_host(parsed.hostname or "") or port is None or not 1 <= port <= 65535:
+        raise ValueError("invalid endpoint")
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+def validated_ipv4_endpoint(value, route_value=None):
+    normalized = endpoint(value)
+    parsed = urllib.parse.urlsplit("//" + normalized)
+    host, port = parsed.hostname, parsed.port
+    if port != 443:
+        raise ValueError("IP Shield endpoint must use port 443")
+    route_address = None
+    if route_value not in (None, ""):
+        try:
+            route_address = ipaddress.ip_address(str(route_value).strip())
+        except ValueError as exc:
+            raise ValueError("invalid server route address") from exc
+        if route_address.version != 4 or not route_address.is_global:
+            raise ValueError("server route must be a public IPv4 address")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if route_address is not None:
+            address = route_address
+        else:
+            answers = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            if not answers:
+                raise ValueError("cannot resolve server endpoint")
+            address = ipaddress.ip_address(answers[0][4][0])
+    if address.version != 4 or not address.is_global:
+        raise ValueError("server endpoint must resolve to a public IPv4 address")
+    if route_address is not None and address != route_address:
+        raise ValueError("server route does not match the endpoint address")
+    return normalized, str(address)
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(source, flags)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+        raise ValueError("invalid source config")
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        fd = -1
+        raw = json.load(handle)
+finally:
+    if fd >= 0:
+        os.close(fd)
+
+if not isinstance(raw, dict):
+    raise ValueError("config must be a JSON object")
+
+hex_key = re.compile(r"[0-9a-fA-F]{64}")
+psk = str(raw.get("psk_key", ""))
+transport_key = str(raw.get("transport_key", psk))
+reality_public = str(raw.get("reality_server_public_key", ""))
+if not hex_key.fullmatch(psk) or not hex_key.fullmatch(reality_public) or not hex_key.fullmatch(transport_key):
+    raise ValueError("invalid tunnel key")
+
+shield = str(raw.get("reality_shield_preset") or "").strip()
+if shield != "ip":
+    raise ValueError("only IP Shield is supported")
+if raw.get("verify_server_certificate") is not True:
+    raise ValueError("IP Shield requires server certificate verification")
+
+doh_domain = str(raw.get("doh_domain") or "").strip()
+if doh_domain and not valid_host(doh_domain):
+    raise ValueError("invalid DoH domain")
+
+buffer_size = int(raw.get("buffer_size", 1000))
+reconnect_interval = int(raw.get("reconnect_interval", 5))
+fingerprint_mode = str(raw.get("fingerprint_mode") or "auto").strip().lower()
+if not 64 <= buffer_size <= 65535:
+    raise ValueError("invalid buffer size")
+if not 1 <= reconnect_interval <= 300:
+    raise ValueError("invalid reconnect interval")
+if fingerprint_mode not in {"auto", "mobile", "desktop"}:
+    raise ValueError("invalid fingerprint mode")
+
+server_endpoint, server_route_ip = validated_ipv4_endpoint(
+    raw.get("server_address"), raw.get("server_route_ip")
+)
+
+clean = {
+    # Preserve a DNS endpoint for TLS identity/SNI, but pin its resolved route
+    # separately before the startup DNS guard is installed. The daemon verifies
+    # the domain certificate while routing setup never needs an unprotected lookup.
+    "server_address": server_endpoint,
+    "server_route_ip": server_route_ip,
+    "server_dial_address": f"{server_route_ip}:443",
+    "psk_key": psk.lower(),
+    "transport_key": transport_key.lower(),
+    "protocol": "http2",
+    "reality_server_public_key": reality_public.lower(),
+    "reality_shield_preset": shield,
+    "verify_server_certificate": True,
+    "doh_domain": doh_domain,
+    "buffer_size": buffer_size,
+    "reconnect_interval": reconnect_interval,
+    "fingerprint_mode": fingerprint_mode,
+    "tun_name": "cham0",
+    "tun_addr": "10.10.0.2/32",
+    "mtu": 1420,
+    "configure_tun": True,
+    "status_file": status_file,
+    # Used only when netctl passes the stream listener: the client keeps this
+    # route while the server offers TCP streams.
+    "tcp_stream_route": {
+        "table": int(os.environ["TCP_STREAM_TABLE"]),
+        "via": os.environ["TCP_STREAM_NS_IP"],
+        "dev": os.environ["TCP_STREAM_IF"],
+    },
+}
+
+directory = os.path.dirname(destination)
+chameleon_gid = grp.getgrnam(os.environ["CHAM_GROUP"]).gr_gid
+fd, temp_name = tempfile.mkstemp(prefix=".client.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(clean, handle, separators=(",", ":"))
+        handle.flush()
+        os.fchown(handle.fileno(), 0, chameleon_gid)
+        os.fchmod(handle.fileno(), 0o640)
+        os.fsync(handle.fileno())
+    os.replace(temp_name, destination)
+finally:
+    try:
+        os.unlink(temp_name)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+ensure_chameleon_identity() {
+  if ! getent group "$CHAM_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$CHAM_GROUP" || return 1
+  fi
+  if id -u "$CHAM_USER" >/dev/null 2>&1; then
+    [[ "$(id -gn "$CHAM_USER" 2>/dev/null)" == "$CHAM_GROUP" ]] || return 1
+    [[ "$(id -nG "$CHAM_USER" 2>/dev/null)" == "$CHAM_GROUP" ]] || return 1
+    local account_shell
+    account_shell="$(getent passwd "$CHAM_USER" | cut -d: -f7)"
+    [[ "$account_shell" == "/usr/sbin/nologin" || "$account_shell" == "/sbin/nologin" ]] || return 1
+  else
+    useradd --system --gid "$CHAM_GROUP" --home-dir /nonexistent --no-create-home \
+      --shell /usr/sbin/nologin "$CHAM_USER" || return 1
+  fi
+
+  install -d -o root -g "$CHAM_GROUP" -m 0750 "$RUNTIME_DIR" || return 1
+  install -d -o "$CHAM_USER" -g "$CHAM_GROUP" -m 0700 "$STATUS_DIR" || return 1
+}
+
+write_chameleon_unit() {
+  # $1=true when the TCP stream listener is prepared for the client.
+  local tcp_streams="${1:-false}" unit_tmp stream_unit="" stream_service=""
+  if [[ "$tcp_streams" == "true" ]]; then
+    stream_unit="Wants=$TCP_STREAM_SOCKET
+After=$TCP_STREAM_SOCKET"
+    stream_service="Sockets=$TCP_STREAM_SOCKET"
+  fi
+  unit_tmp="$(mktemp "${CHAM_UNIT}.tmp.XXXXXX")" || return 1
+  cat > "$unit_tmp" <<EOF
+[Unit]
+Description=Chameleon client (managed by the Chameleon Panel)
+After=network-online.target
+$stream_unit
+
+[Service]
+Type=simple
+$stream_service
+User=$CHAM_USER
+Group=$CHAM_GROUP
+ExecStart=$CHAM_BIN -config $SAFE_CONF -status $STATUS_FILE
+# The TUN device is recreated when systemd restarts the client. Linux removes
+# routes bound to the old device, so restore the policy-table default after the
+# new cham0 appears. The less-preferred blackhole remains the fail-closed path.
+ExecStartPost=+/bin/bash $STEALTH_SCRIPT restore-route
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+KillMode=control-group
+UMask=0077
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=$STATUS_DIR
+MemoryMax=256M
+TasksMax=128
+LimitNOFILE=4096
+StandardOutput=append:$LOG
+StandardError=append:$LOG
+EOF
+  chown root:root "$unit_tmp" || { rm -f -- "$unit_tmp"; return 1; }
+  chmod 0644 "$unit_tmp" || { rm -f -- "$unit_tmp"; return 1; }
+  mv -f -- "$unit_tmp" "$CHAM_UNIT" || { rm -f -- "$unit_tmp"; return 1; }
+}
+
+daemon_alive() {
+  systemctl is-active --quiet "$CHAM_SERVICE" 2>/dev/null || pgrep -f "$CHAM_BIN" >/dev/null 2>&1
+}
+
+install_runtime_routes() {
+  ip route replace blackhole default metric 42760 table "$RT_TABLE" || return 1
+  ip route replace default dev "$IF" metric 10 table "$RT_TABLE" || return 1
+  if ip rule show 2>/dev/null | grep "lookup $DNS_RT_TABLE" >/dev/null; then
+    ip route replace blackhole default metric 42760 table "$DNS_RT_TABLE" || return 1
+    ip route replace default dev "$IF" metric 10 table "$DNS_RT_TABLE" || return 1
+  fi
+}
+
+restore_runtime_route() {
+  # ExecStartPost runs as soon as the client process starts. The client creates
+  # cham0 first and brings it up a moment later; a route through a link that is
+  # not up yet is rejected ("Device for nexthop is not up"). Wait for the UP
+  # flag, not mere existence, and keep retrying within the same time budget.
+  # The link line is captured first: an early-exiting grep in a pipeline would
+  # trip pipefail even when the flag is present.
+  local i link up_flag='[<,]UP[,>]'
+  for i in $(seq 1 30); do
+    link="$(ip -o link show "$IF" 2>/dev/null)" || link=""
+    if [[ $link =~ $up_flag ]]; then
+      install_runtime_routes 2>/dev/null && return 0
+    fi
+    sleep 0.5
+  done
+  install_runtime_routes
+}
+
+# The stream namespace is a bind mount under /run/netns that systemd has to
+# see to open the listener inside it (NetworkNamespacePath=). The panel runs
+# this script in its own mount namespace (PrivateTmp=), where that mount stays
+# invisible to systemd. Namespace work therefore runs in a transient systemd
+# unit, which always lives in the host's mount namespace.
+tcp_streams_in_host_ns() { # install <server-ipv4> | clear
+  if [[ "${CHAMELEON_HOST_NS:-}" == "1" ]]; then
+    case "$1" in
+      install) install_tcp_streams "$2" ;;
+      clear) clear_tcp_streams ;;
+    esac
+    return
+  fi
+  systemd-run --quiet --wait --collect --pipe --service-type=oneshot \
+    --setenv=CHAMELEON_HOST_NS=1 -p TimeoutStartSec=20s \
+    /bin/bash "$STEALTH_SCRIPT" tcp-streams "$@"
+}
+
+do_tcp_streams() {
+  # Internal: only tcp_streams_in_host_ns calls this, inside its transient unit.
+  [[ "${CHAMELEON_HOST_NS:-}" == "1" ]] || err "internal subcommand"
+  case "${1:-}" in
+    install)
+      [[ "${2:-}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && validate_ip_csv "$2" ||
+        err "invalid server address"
+      install_tcp_streams "$2" ;;
+    clear) clear_tcp_streams ;;
+    *) err "unknown tcp-streams action" ;;
+  esac
+}
+
+jval() {
+  /usr/bin/python3 - "$1" "$2" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, key = sys.argv[1:]
+try:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise ValueError("invalid status file")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = json.load(handle).get(key, "")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    value = ""
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, (str, int, float)):
+    print(value)
+PY
+}
+
+# ── DNS policy (persistent intent) ──────────────────────────────────────────────
+write_dns_policy() {
+  # $1=true|false $2=block_quic
+  local enabled="$1" block_quic="$2"
+  [[ ! -L "$POLICY_DIR" && ! -L "$DNS_POLICY_FILE" ]] || return 1
+  install -d -o root -g root -m 0750 "$POLICY_DIR" || return 1
+  local temporary
+  temporary="$(mktemp "$POLICY_DIR/.dns-policy.XXXXXX")" || return 1
+  if ! printf '{"version":2,"enabled":%s,"block_quic":%s}\n' "$enabled" "$block_quic" > "$temporary" \
+      || ! chmod 0640 "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  mv -f -- "$temporary" "$DNS_POLICY_FILE" || { rm -f -- "$temporary"; return 1; }
+}
+
+read_dns_policy() {
+  # Prints "enabled block_quic". Missing file: disabled. Damaged or unsafe:
+  # protection on (fail closed).
+  [[ -e "$DNS_POLICY_FILE" ]] || { echo "false true"; return 0; }
+  local uid mode text
+  uid="$(stat -c '%u' -- "$DNS_POLICY_FILE" 2>/dev/null)" || { echo "true true"; return 0; }
+  mode="$(stat -c '%a' -- "$DNS_POLICY_FILE" 2>/dev/null)" || { echo "true true"; return 0; }
+  if [[ -L "$DNS_POLICY_FILE" || "$uid" != "0" || $((8#$mode & 8#022)) -ne 0 ]]; then
+    echo "true true"; return 0
+  fi
+  text="$(head -c 4096 -- "$DNS_POLICY_FILE" 2>/dev/null)"
+  if [[ "$text" =~ \"enabled\":(true|false) ]]; then
+    local enabled="${BASH_REMATCH[1]}" quic="true"
+    [[ "$text" =~ \"block_quic\":false ]] && quic="false"
+    echo "$enabled $quic"
+  else
+    echo "true true"
+  fi
+}
+
+# ── fail-closed DNS: resolver egress only through cham0 ───────────────────────
+install_strict_dns_routing_rules() {
+  ensure_dns_proxy_identity || return 1
+  local dns_uid
+  dns_uid="$(id -u "$DNS_PROXY_USER")" || return 1
+  install_dns_egress_guard "$dns_uid" || return 1
+  ip route replace blackhole default metric 42760 table "$DNS_RT_TABLE" || return 1
+  if ip link show "$IF" >/dev/null 2>&1; then
+    ip route replace default dev "$IF" metric 10 table "$DNS_RT_TABLE" || return 1
+  fi
+  while ip rule del pref "$DNS_PROXY_STAGING_PREF" 2>/dev/null; do :; done
+  ip rule add uidrange "$dns_uid-$dns_uid" lookup "$DNS_RT_TABLE" pref "$DNS_PROXY_STAGING_PREF" || return 1
+  while ip rule del pref "$DNS_PROXY_PREF" 2>/dev/null; do :; done
+  ip rule add uidrange "$dns_uid-$dns_uid" lookup "$DNS_RT_TABLE" pref "$DNS_PROXY_PREF" || return 1
+  while ip rule del pref "$DNS_PROXY_STAGING_PREF" 2>/dev/null; do :; done
+}
+
+install_dns_redirect() {
+  # Every DNS query of this device goes to the local resolver, except the
+  # resolver's own upstream queries and the client's. Built in a new chain
+  # attached before the old one is removed: no unredirected gap.
+  ensure_dns_proxy_identity || return 1
+  local dns_uid client_uid next="CH_DNSR_${BASHPID}_${RANDOM}" chain proto
+  dns_uid="$(id -u "$DNS_PROXY_USER")" || return 1
+  client_uid="$(id -u "$CHAM_USER" 2>/dev/null || echo "")"
+  iptables -t nat -N "$next" || return 1
+  iptables -t nat -A "$next" -m owner --uid-owner "$dns_uid" -j RETURN || return 1
+  if [[ -n "$client_uid" ]]; then
+    iptables -t nat -A "$next" -m owner --uid-owner "$client_uid" -j RETURN || return 1
+  fi
+  for proto in udp tcp; do
+    iptables -t nat -A "$next" -p "$proto" --dport 53 -j REDIRECT --to-ports "$DNS_PROXY_PORT" || return 1
+  done
+  iptables -t nat -I OUTPUT 1 -j "$next" || return 1
+  clear_dns_redirect_chain "$DNS_REDIRECT_CHAIN"
+  iptables -t nat -E "$next" "$DNS_REDIRECT_CHAIN" || return 1
+  while IFS= read -r chain; do
+    [[ -n "$chain" ]] && clear_dns_redirect_chain "$chain"
+  done < <(iptables -t nat -S 2>/dev/null | awk '$1 == "-N" && index($2, "CH_DNSR_") == 1 {print $2}')
+  return 0
+}
+
+clear_dns_redirect_chain() {
+  local chain="$1" line
+  local -a rule=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r -a rule <<< "${line/#-A /-D }"
+    iptables -t nat "${rule[@]}" 2>/dev/null || true
+  done < <(iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "-j ${chain}$" || true)
+  iptables -t nat -F "$chain" 2>/dev/null || true
+  iptables -t nat -X "$chain" 2>/dev/null || true
+}
+
+clear_dns_redirect() {
+  clear_dns_redirect_chain "$DNS_REDIRECT_CHAIN"
+  local chain
+  while IFS= read -r chain; do
+    [[ -n "$chain" ]] && clear_dns_redirect_chain "$chain"
+  done < <(iptables -t nat -S 2>/dev/null | awk '$1 == "-N" && index($2, "CH_DNSR_") == 1 {print $2}')
+  return 0
+}
+
+dns_redirect_active() {
+  iptables -t nat -S OUTPUT 2>/dev/null | grep -E -- "-j ${DNS_REDIRECT_CHAIN}$" >/dev/null
+}
+
+install_strict_dns_routing() {
+  install_strict_dns_routing_rules || return 1
+  install_dns_redirect || return 1
+  systemctl start "$DNS_PROXY_SERVICE" >/dev/null 2>&1 || return 1
+}
+
+activate_strict_dns_policy() {
+  # $1=block_quic. Guards first, then publish intent, then the resolver.
+  install_strict_dns_routing_rules || return 1
+  install_dns_redirect || return 1
+  write_dns_policy true "$1" || return 1
+  systemctl start "$DNS_PROXY_SERVICE" >/dev/null 2>&1 || return 1
+}
+
+clear_strict_dns_routing() {
+  clear_dns_redirect
+  while ip rule del pref "$DNS_PROXY_STAGING_PREF" 2>/dev/null; do :; done
+  while ip rule del pref "$DNS_PROXY_PREF" 2>/dev/null; do :; done
+  ip route flush table "$DNS_RT_TABLE" 2>/dev/null || true
+  clear_dns_egress_guard
+}
+
+# ── kill switch: this device reaches the internet only through the tunnel ─────
+PRIVATE_NETS="10.0.0.0/8 100.64.0.0/10 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16"
+
+install_host_guard() {
+  # $1=server IPv4 (may be empty at boot). Allows loopback, the tunnel, the
+  # stream path, the local network, broadcast/multicast (DHCP), the client's
+  # own connection and the panel's connection to its server; rejects every
+  # other packet this device sends. Replaced without a gap: the new chain is
+  # attached before the old one goes.
+  local srv="${1:-}" net client_uid panel_uid
+  local next4="CH_HOST4_${BASHPID}_${RANDOM}" next6="CH_HOST6_${BASHPID}_${RANDOM}"
+  client_uid="$(id -u "$CHAM_USER" 2>/dev/null || echo "")"
+  panel_uid="$(id -u "$PANEL_USER" 2>/dev/null || echo "")"
+
+  iptables -N "$next4" || return 1
+  iptables -A "$next4" -o lo -j RETURN || return 1
+  iptables -A "$next4" -o "$IF" -j RETURN || return 1
+  iptables -A "$next4" -o "$TCP_STREAM_IF" -j RETURN || return 1
+  for net in $PRIVATE_NETS 224.0.0.0/4 255.255.255.255/32; do
+    iptables -A "$next4" -d "$net" -j RETURN || return 1
+  done
+  if [[ -n "$client_uid" ]]; then
+    iptables -A "$next4" -m owner --uid-owner "$client_uid" -j RETURN || return 1
+  fi
+  if [[ -n "$panel_uid" && -n "$srv" ]]; then
+    iptables -A "$next4" -m owner --uid-owner "$panel_uid" -d "$srv/32" -j RETURN || return 1
+  fi
+  iptables -A "$next4" -j REJECT --reject-with icmp-net-unreachable || return 1
+
+  ip6tables -N "$next6" || return 1
+  # The tunnel carries IPv4 only: IPv6 stays closed, in the local network too.
+  ip6tables -A "$next6" -o lo -j RETURN || return 1
+  ip6tables -A "$next6" -j REJECT || return 1
+
+  iptables -I OUTPUT 1 -j "$next4" || return 1
+  ip6tables -I OUTPUT 1 -j "$next6" || return 1
+  clear_output_chain iptables "$HOST_CHAIN" || return 1
+  clear_output_chain ip6tables "$HOST6_CHAIN" || return 1
+  iptables -E "$next4" "$HOST_CHAIN" || return 1
+  ip6tables -E "$next6" "$HOST6_CHAIN" || return 1
+  clear_stale_chains iptables "CH_HOST4_"
+  clear_stale_chains ip6tables "CH_HOST6_"
+}
+
+clear_output_chain() {
+  local tool="$1" chain="$2" line
+  local -a rule=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r -a rule <<< "${line/#-A /-D }"
+    "$tool" "${rule[@]}" || return 1
+  done < <("$tool" -S OUTPUT 2>/dev/null | grep -E -- "-j ${chain}$" || true)
+  if "$tool" -S "$chain" >/dev/null 2>&1; then
+    "$tool" -F "$chain" || return 1
+    "$tool" -X "$chain" || return 1
+  fi
+}
+
+clear_stale_chains() {
+  local tool="$1" prefix="$2" chain
+  while IFS= read -r chain; do
+    [[ -n "$chain" ]] && clear_output_chain "$tool" "$chain"
+  done < <("$tool" -S 2>/dev/null | awk -v prefix="$prefix" '$1 == "-N" && index($2, prefix) == 1 {print $2}')
+  return 0
+}
+
+clear_host_guard() {
+  clear_output_chain iptables "$HOST_CHAIN" 2>/dev/null || true
+  clear_output_chain ip6tables "$HOST6_CHAIN" 2>/dev/null || true
+  clear_stale_chains iptables "CH_HOST4_"
+  clear_stale_chains ip6tables "CH_HOST6_"
+}
+
+host_guard_active() {
+  output_jump_present iptables "$HOST_CHAIN" && output_jump_present ip6tables "$HOST6_CHAIN"
+}
+
+# ── routing: this device's traffic into the tunnel table ──────────────────────
+install_host_routing() {
+  # $1=server IPv4. The client and the panel's link to its server stay on the
+  # ordinary uplink; the local network stays local; everything else uses the
+  # tunnel table (cham0, with a blackhole behind it).
+  local srv="$1" client_uid panel_uid net
+  client_uid="$(id -u "$CHAM_USER")" || return 1
+  panel_uid="$(id -u "$PANEL_USER" 2>/dev/null || echo "")"
+  clear_host_routing
+  ip route replace blackhole default metric 42760 table "$RT_TABLE" || return 1
+  ip rule add uidrange "$client_uid-$client_uid" lookup main pref "$CLIENT_PREF" || return 1
+  if [[ -n "$panel_uid" ]]; then
+    ip rule add uidrange "$panel_uid-$panel_uid" to "$srv/32" lookup main pref "$PANEL_PREF" || return 1
+  fi
+  for net in $PRIVATE_NETS; do
+    ip rule add to "$net" lookup main pref "$MGMT_PREF" || return 1
+  done
+  ip rule add to 100.64.0.0/10 lookup 52 pref "$TAILSCALE_PREF" || return 1
+  ip rule add lookup "$RT_TABLE" pref "$HOST_PREF" || return 1
+}
+
+clear_host_routing() {
+  local pref
+  for pref in "$CLIENT_PREF" "$PANEL_PREF" "$MGMT_PREF" "$TAILSCALE_PREF" "$HOST_PREF"; do
+    while ip rule del pref "$pref" 2>/dev/null; do :; done
+  done
+  ip route flush table "$RT_TABLE" 2>/dev/null
+  return 0
+}
+
+install_quic_guard() {
+  # $1=true|false. QUIC (UDP 443) is refused so browsers fall back to TCP.
+  while iptables -D OUTPUT -j "$QUIC_CHAIN" 2>/dev/null; do :; done
+  iptables -F "$QUIC_CHAIN" 2>/dev/null
+  iptables -X "$QUIC_CHAIN" 2>/dev/null
+  [[ "$1" == "true" ]] || return 0
+  iptables -N "$QUIC_CHAIN" || return 1
+  iptables -A "$QUIC_CHAIN" -o lo -j RETURN || return 1
+  iptables -A "$QUIC_CHAIN" -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable || return 1
+  iptables -I OUTPUT 1 -j "$QUIC_CHAIN" || return 1
+}
+
+clear_quic_guard() {
+  while iptables -D OUTPUT -j "$QUIC_CHAIN" 2>/dev/null; do :; done
+  iptables -F "$QUIC_CHAIN" 2>/dev/null
+  iptables -X "$QUIC_CHAIN" 2>/dev/null
+  return 0
+}
+
+# ── TCP streams: this device's TCP carried as separate streams ────────────────
+clear_tcp_streams() {
+  systemctl stop "$TCP_STREAM_SOCKET" >/dev/null 2>&1 || true
+  rm -f -- "$TCP_STREAM_SOCKET_UNIT"
+  while ip rule del pref "$TCP_STREAM_VPS_PREF" 2>/dev/null; do :; done
+  while ip rule del pref "$TCP_STREAM_PREF" 2>/dev/null; do :; done
+  ip route flush table "$TCP_STREAM_TABLE" 2>/dev/null
+  ip link del "$TCP_STREAM_IF" 2>/dev/null
+  ip netns del "$TCP_STREAM_NS" 2>/dev/null
+  return 0
+}
+
+install_tcp_streams() {
+  # $1=Chameleon server IPv4. Prepares the stream path; the client adds the
+  # default route of the stream table once the server offers streams. Until
+  # then the stream table is empty and TCP falls through to the packet tunnel.
+  local srv="$1" unit_tmp
+  clear_tcp_streams
+  modprobe xt_TPROXY 2>/dev/null || return 1
+  ip netns add "$TCP_STREAM_NS" || return 1
+  ip link add "$TCP_STREAM_IF" type veth peer name "$TCP_STREAM_NS_IF" || return 1
+  ip link set "$TCP_STREAM_NS_IF" netns "$TCP_STREAM_NS" || return 1
+  ip addr add "$TCP_STREAM_HOST_IP/30" dev "$TCP_STREAM_IF" || return 1
+  ip link set "$TCP_STREAM_IF" up || return 1
+  sysctl -qw "net.ipv4.conf.$TCP_STREAM_IF.rp_filter=0" || return 1
+  ip netns exec "$TCP_STREAM_NS" /bin/bash -euo pipefail -c "
+    ip link set lo up
+    ip addr add $TCP_STREAM_NS_IP/30 dev $TCP_STREAM_NS_IF
+    ip link set $TCP_STREAM_NS_IF up
+    ip route add default via $TCP_STREAM_HOST_IP dev $TCP_STREAM_NS_IF
+    sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.$TCP_STREAM_NS_IF.rp_filter=0
+    sysctl -qw net.ipv4.conf.all.src_valid_mark=0
+    ip rule add fwmark 0x1/0x1 lookup 100
+    ip route add local 0.0.0.0/0 dev lo table 100
+    iptables -t mangle -A PREROUTING -i $TCP_STREAM_NS_IF -p tcp -j TPROXY --on-port $TCP_STREAM_PORT --tproxy-mark 0x1/0x1
+  " || return 1
+  # The stream server never dials its own address; TCP to it keeps cham0.
+  ip rule add pref "$TCP_STREAM_VPS_PREF" to "$srv/32" lookup "$RT_TABLE" || return 1
+  ip rule add pref "$TCP_STREAM_PREF" ipproto tcp lookup "$TCP_STREAM_TABLE" || return 1
+  unit_tmp="$(mktemp "${TCP_STREAM_SOCKET_UNIT}.tmp.XXXXXX")" || return 1
+  cat > "$unit_tmp" <<EOF
+[Unit]
+Description=Chameleon TCP stream listener
+
+[Socket]
+ListenStream=0.0.0.0:$TCP_STREAM_PORT
+Transparent=yes
+FreeBind=yes
+Backlog=1024
+NetworkNamespacePath=/run/netns/$TCP_STREAM_NS
+Service=$CHAM_SERVICE
+EOF
+  chmod 0644 "$unit_tmp" || { rm -f -- "$unit_tmp"; return 1; }
+  mv -f -- "$unit_tmp" "$TCP_STREAM_SOCKET_UNIT" || { rm -f -- "$unit_tmp"; return 1; }
+}
+
+# ── start / stop ───────────────────────────────────────────────────────────────
+stop_runtime() {
+  # Client, socket, routes and rules go; the kill switch and the DNS guard
+  # stay, so a restart or a failed start never opens a direct path.
+  systemctl stop "$TCP_STREAM_SOCKET" >/dev/null 2>&1 || true
+  systemctl stop "$CHAM_SERVICE" >/dev/null 2>&1 || true
+  tcp_streams_in_host_ns clear >/dev/null 2>&1
+  rm -f -- "$CHAM_UNIT"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  clear_host_routing
+  clear_quic_guard
+  rm -f "$STATE" "$STATUS_FILE"
+}
+
+report_tunnel_start_failure() {
+  local message="$1" failure_code=""
+  [[ -f "$STATUS_FILE" && ! -L "$STATUS_FILE" ]] \
+    && failure_code="$(jval "$STATUS_FILE" failure_code)"
+  stop_runtime
+  case "$failure_code" in
+    server_unavailable|server_timeout) temporary_err "$message" ;;
+    *) err "$message" ;;
+  esac
+}
+
+do_up() {
+  local src="${1:-}" block_quic="${2:-true}"
+  [[ -n "$src" ]] || err "usage: up <src_conf> [block_quic]"
+  [[ "$src" == "$SOURCE_CONF" ]] || err "config path is not allowed"
+  [[ "$block_quic" == "true" || "$block_quic" == "false" ]] || err "invalid block_quic value"
+  [[ "$(realpath -e -- "$src" 2>/dev/null)" == "$SOURCE_CONF" ]] || err "config path is not canonical"
+  ensure_chameleon_identity || err "cannot create the restricted client account"
+  prepare_client_config "$src" || err "invalid client configuration"
+  chown root:"$CHAM_GROUP" "$SAFE_CONF" || err "cannot protect the runtime client configuration"
+  chmod 0640 "$SAFE_CONF" || err "cannot protect the runtime client configuration"
+  [[ -x "$CHAM_BIN" ]] || err "chameleon-client binary not installed at $CHAM_BIN"
+  [[ "$(stat -c '%u' -- "$CHAM_BIN" 2>/dev/null)" == "0" ]] || err "chameleon-client must be root-owned"
+  local bin_mode srv
+  bin_mode="$(stat -c '%a' -- "$CHAM_BIN")"
+  [[ $((8#$bin_mode & 8#022)) -eq 0 ]] || err "chameleon-client must not be writable outside root"
+  srv="$(cham_server_ip "$SAFE_CONF")"
+  [[ -n "$srv" ]] || err "cannot resolve the Chameleon server"
+
+  # Fail closed first: from here on this device reaches the internet only
+  # through the tunnel, also while it starts or if it fails.
+  install_host_guard "$srv" || err "failed to install the kill switch"
+  activate_strict_dns_policy "$block_quic" || err "failed to activate fail-closed DNS"
+  stop_runtime
+  install_host_routing "$srv" || { stop_runtime; err "failed to install tunnel routing"; }
+  install_quic_guard "$block_quic" || { stop_runtime; err "failed to block QUIC"; }
+  tune_tcp_transport
+
+  # TCP is carried as streams when this host can run the transparent
+  # listener; otherwise, and while the server offers no streams, it stays on
+  # the packet tunnel.
+  local tcp_streams=false
+  if tcp_streams_in_host_ns install "$srv" >/dev/null 2>&1; then
+    tcp_streams=true
+  else
+    tcp_streams_in_host_ns clear >/dev/null 2>&1
+  fi
+  write_chameleon_unit "$tcp_streams" || { stop_runtime; err "failed to create the client service"; }
+  install -o "$CHAM_USER" -g "$CHAM_GROUP" -m 0600 /dev/null "$STATUS_FILE" \
+    || { stop_runtime; err "failed to prepare the status file"; }
+  systemctl daemon-reload >/dev/null 2>&1 || { stop_runtime; err "failed to reload systemd"; }
+  if [[ "$tcp_streams" == "true" ]] && ! systemctl start "$TCP_STREAM_SOCKET" >/dev/null 2>&1; then
+    tcp_streams_in_host_ns clear >/dev/null 2>&1
+    write_chameleon_unit false || { stop_runtime; err "failed to create the client service"; }
+    systemctl daemon-reload >/dev/null 2>&1 || { stop_runtime; err "failed to reload systemd"; }
+  fi
+  systemctl start "$CHAM_SERVICE" >/dev/null 2>&1 \
+    || report_tunnel_start_failure "failed to start the client service"
+
+  local i
+  for i in $(seq 1 30); do ip link show "$IF" >/dev/null 2>&1 && break; sleep 0.5; done
+  ip link show "$IF" >/dev/null 2>&1 \
+    || report_tunnel_start_failure "the client did not create the tunnel interface"
+  restore_runtime_route || report_tunnel_start_failure "failed to route through the tunnel"
+  install_strict_dns_routing || report_tunnel_start_failure "failed to attach DNS to the tunnel"
+
+  printf 'IF=%s\nBLOCK_QUIC=%s\nSERVER=%s\nUP_TS=%s\n' "$IF" "$block_quic" "$srv" "$(date +%s)" > "$STATE"
+  local ready failure
+  for i in $(seq 1 20); do
+    if [[ -f "$STATUS_FILE" ]]; then
+      ready=$(jval "$STATUS_FILE" connected)
+      failure=$(jval "$STATUS_FILE" failure_code)
+      [[ "$ready" == "true" || -n "$failure" ]] && break
+    fi
+    daemon_alive || break
+    sleep 0.5
+  done
+  do_status
+}
+
+do_down() {
+  stop_runtime
+  pkill -TERM -f "$CHAM_BIN" 2>/dev/null; sleep 0.3; pkill -KILL -f "$CHAM_BIN" 2>/dev/null
+  write_dns_policy false true || err "tunnel stopped, but the protection could not be disabled safely"
+  clear_strict_dns_routing
+  clear_host_guard
+  do_status
+}
+
+do_resume() {
+  # Boot: restore an enabled tunnel. The guards stay installed whatever
+  # happens; an unreachable server is a degraded but safe state.
+  local enabled block_quic
+  read -r enabled block_quic <<< "$(read_dns_policy)"
+  if [[ "$enabled" != "true" ]]; then
+    clear_strict_dns_routing
+    clear_host_guard
+    do_status
+    return 0
+  fi
+  local srv=""
+  [[ -f "$SOURCE_CONF" && ! -L "$SOURCE_CONF" ]] && srv="$(cham_server_ip "$SOURCE_CONF")"
+  install_host_guard "$srv" || { json '{"success":false,"error":"failed to restore the kill switch"}'; return 1; }
+  install_strict_dns_routing || { json '{"success":false,"error":"failed to restore fail-closed DNS"}'; return 1; }
+  if [[ ! -f "$SOURCE_CONF" || -L "$SOURCE_CONF" \
+      || "$(realpath -e -- "$SOURCE_CONF" 2>/dev/null)" != "$SOURCE_CONF" ]]; then
+    json '{"success":false,"error":"the tunnel is enabled, but its client configuration is missing or unsafe"}'
+    return 1
+  fi
+  local output rc=0
+  output="$(do_up "$SOURCE_CONF" "$block_quic")" || rc=$?
+  printf '%s\n' "$output"
+  if (( rc == 75 )); then
+    host_guard_active && strict_dns_guard_active && return 0
+  fi
+  return "$rc"
+}
+
+do_guard() {
+  # Before networking at boot: if the tunnel is enabled, block everything
+  # but the tunnel's own path until resume connects.
+  local enabled block_quic
+  read -r enabled block_quic <<< "$(read_dns_policy)"
+  if [[ "$enabled" != "true" ]]; then
+    clear_strict_dns_routing
+    clear_host_guard
+    return 0
+  fi
+  local srv=""
+  [[ -f "$SOURCE_CONF" && ! -L "$SOURCE_CONF" ]] && srv="$(cham_server_ip "$SOURCE_CONF")"
+  install_host_guard "$srv" || return 1
+  install_strict_dns_routing_rules || return 1
+  install_dns_redirect || return 1
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+do_status() {
+  local running="false" connected="false" killswitch="false" dns_protected="false" quic_blocked="false"
+  local server="" fp="" behavior="" sent="0" recv="0" shield=""
+  local failure_code="" health_error="" failed_at="" enabled
+  read -r enabled _ <<< "$(read_dns_policy)"
+  if daemon_alive && ip link show "$IF" >/dev/null 2>&1; then running="true"; fi
+  if [[ -f "$STATUS_FILE" ]]; then
+    connected=$(jval "$STATUS_FILE" connected); [[ "$connected" == "true" ]] || connected="false"
+    server=$(jval "$STATUS_FILE" server_addr); fp=$(jval "$STATUS_FILE" fingerprint)
+    behavior=$(jval "$STATUS_FILE" behavior); sent=$(jval "$STATUS_FILE" bytes_sent); recv=$(jval "$STATUS_FILE" bytes_recv)
+    shield=$(jval "$STATUS_FILE" shield_domain)
+    failure_code=$(jval "$STATUS_FILE" failure_code); health_error=$(jval "$STATUS_FILE" health_error)
+    failed_at=$(jval "$STATUS_FILE" failed_at)
+  elif [[ "$running" != "true" && "$enabled" == "true" ]]; then
+    failure_code="client_stopped"
+    health_error="The kill switch is active, but the Chameleon client is not connected"
+  fi
+  host_guard_active && killswitch="true"
+  if strict_dns_guard_active && dns_redirect_active; then dns_protected="true"; fi
+  iptables -C OUTPUT -j "$QUIC_CHAIN" 2>/dev/null && quic_blocked="true"
+  local tcp_streams="false"
+  ip route show table "$TCP_STREAM_TABLE" 2>/dev/null | grep '^default' >/dev/null && tcp_streams="true"
+  json "{\"success\":true,\"running\":$running,\"connected\":$connected,\"server\":\"$(jesc "$server")\",\"fingerprint\":\"$(jesc "$fp")\",\"behavior\":\"$(jesc "$behavior")\",\"shield\":\"$(jesc "$shield")\",\"bytes_sent\":${sent:-0},\"bytes_recv\":${recv:-0},\"killswitch\":$killswitch,\"dns_protected\":$dns_protected,\"quic_blocked\":$quic_blocked,\"tcp_streams\":$tcp_streams,\"failure_code\":\"$(jesc "$failure_code")\",\"health_error\":\"$(jesc "$health_error")\",\"failed_at\":\"$(jesc "$failed_at")\"}"
+}
+
+main() {
+  case "${1:-status}" in
+    up)        shift; do_up "$@" ;;
+    guard)     do_guard ;;
+    resume)    do_resume ;;
+    restore-route) restore_runtime_route ;;
+    tcp-streams) shift; do_tcp_streams "$@" ;;
+    down)      do_down ;;
+    status)    do_status ;;
+    *) err "unknown subcommand" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  # The internal namespace helper must not provision anything.
+  if [[ "${1:-}" != "tcp-streams" ]]; then
+    initialize_runtime_paths "${1:-status}" || exit 1
+  fi
+  main "$@"
+fi

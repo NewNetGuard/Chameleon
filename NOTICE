@@ -1,0 +1,72 @@
+Chameleon
+Copyright (c) 2026 NewNetGuard
+
+Chameleon's own source code is licensed under the Mozilla Public License 2.0;
+the license text is in LICENSE. Every Chameleon source file carries the MPL-2.0
+notice, with the exceptions below. Files without a notice of their own —
+documentation, data, configuration — are covered by MPL-2.0 through this file,
+unless listed here.
+
+Exceptions in this repository
+-----------------------------
+
+server/site/
+    The cover website shown to anyone who opens a Chameleon server. These files
+    carry no license notice on purpose, so that they do not reveal Chameleon to
+    visitors; they are licensed under MPL-2.0 by this file.
+
+cmd/chameleon-windows/winfw/helpers.go, rules.go, syscall_windows.go,
+types_windows.go, types_windows_64.go, zsyscall_windows.go
+    From WireGuard for Windows, Copyright (C) 2019-2026 WireGuard LLC, under the
+    MIT license (cmd/chameleon-windows/winfw/LICENSE.WireGuard). policy.go in
+    the same directory is Chameleon's own (MPL-2.0).
+
+server/nginx/h2-unbuffered-window-update-threshold.patch
+    The added lines are Chameleon's (MPL-2.0); the context and removed lines
+    come from nginx, under the BSD-2-Clause license (server/nginx/LICENSE.nginx).
+
+third_party/notices/, third_party/licenses/
+    License notices of third-party components, each under its own license.
+
+Images not covered by MPL-2.0
+-----------------------------
+
+panel/frontend/public/banner.webp, panel/frontend/public/chameleon.png and
+panel/frontend/public/favicon.png (a smaller copy of chameleon.png) were
+generated with OpenAI's ChatGPT image generator for this project.
+
+These images are excluded from the MPL-2.0 license of this project: they are
+not "Covered Software", and LICENSE grants no rights in them. This notice makes
+no claim that they are protected by copyright or that anyone holds exclusive
+rights in them. They may be redistributed unmodified together with Chameleon.
+A modified version of Chameleon may remove or replace them.
+
+Names
+-----
+
+MPL-2.0 grants no rights in names or marks (section 2.3). "Chameleon" and
+"EasyPi", the logo and the banner are not licensed under MPL-2.0. Labels such as
+"easypi/..." inside the protocol and "easypi-..." file and unit names on the
+server are technical identifiers kept for compatibility.
+
+Third-party components
+----------------------
+
+Chameleon uses and its release packages contain third-party components under
+their own licenses; see THIRD_PARTY_NOTICES.md, and THIRD_PARTY_LICENSES.txt in
+every release package for the complete list and license texts.
+
+Warranty and limitation of liability
+------------------------------------
+Chameleon is provided as is, without warranty, under section 6 of MPL 2.0.
+You are responsible for your own decisions and actions when installing,
+configuring, operating, or distributing Chameleon, including following
+applicable laws and obtaining any permissions your use requires.
+
+To the fullest extent permitted by applicable law, NewNetGuard and the
+project's contributors disclaim liability for users' acts or omissions,
+including unauthorized use or misuse, and for losses or damages arising
+from the use of or inability to use Chameleon. Section 7 of MPL 2.0 governs
+the limitation of liability for the covered software. This notice
+summarizes the applicable terms and leaves rights under MPL 2.0 and
+mandatory law intact.

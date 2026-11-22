@@ -1,0 +1,22 @@
+# Copyright (c) 2026 NewNetGuard
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[Unit]
+Description=Restore the Chameleon tunnel and strict routing after boot
+After=network-online.target chameleon-guard.service chameleon-dns.service
+Wants=network-online.target chameleon-dns.service
+Requires=chameleon-guard.service
+Before=chameleon-panel.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/chameleon/chameleon-runner chameleon-netctl resume
+RemainAfterExit=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

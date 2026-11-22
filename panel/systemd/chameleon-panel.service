@@ -1,0 +1,40 @@
+# Copyright (c) 2026 NewNetGuard
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[Unit]
+Description=Chameleon Panel (web panel, local network only)
+After=network-online.target chameleon-panel-firewall.service
+Wants=network-online.target
+Requires=chameleon-panel-firewall.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=chameleon
+Group=chameleon
+UMask=0027
+WorkingDirectory=/opt/chameleon/panel
+Environment="PATH=/opt/chameleon/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONPATH=/opt/chameleon/panel"
+EnvironmentFile=-/etc/chameleon/panel.env
+ExecStart=/opt/chameleon/venv/bin/python -m chameleon_panel serve
+KillMode=mixed
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=5
+# Privileged network changes go through sudo to chameleon-runner, so the
+# service cannot use NoNewPrivileges or a read-only system view: they would
+# also bind the root helper. The panel itself writes only its state directory.
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/chameleon-panel
+
+[Install]
+WantedBy=multi-user.target

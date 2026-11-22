@@ -1,0 +1,38 @@
+# Build artifacts — rebuild with ./build.sh (needs Go 1.27.4).
+/bin/
+# Build caches of a standalone checkout (toolchain, patched x/net).
+/.build/
+# Release archives (panel/build-release.sh).
+/dist/
+# Panel web UI dependencies and build output.
+/panel/frontend/node_modules/
+/panel/frontend/dist/
+__pycache__/
+.pytest_cache/
+
+# Private material at any depth. Public verification keys may use .pub.
+Chameleon-Keys/
+secrets/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+*.pk8
+*.p8
+*.private
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.log
+*.pcap
+*.pcapng
+*.sqlite
+*.sqlite3
+*.db
+*.tmp
+*.bak

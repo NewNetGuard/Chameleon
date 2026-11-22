@@ -1,0 +1,23 @@
+# Copyright (c) 2026 NewNetGuard
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[Unit]
+Description=Close the Chameleon Panel port to everything but the local network
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target chameleon-panel.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/chameleon/panel.env
+ExecStart=/usr/lib/chameleon/chameleon-panel-firewall apply
+ExecStop=/usr/lib/chameleon/chameleon-panel-firewall remove
+RemainAfterExit=yes
+UMask=0077
+
+[Install]
+WantedBy=network-pre.target

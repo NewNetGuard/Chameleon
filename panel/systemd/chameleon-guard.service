@@ -1,0 +1,22 @@
+# Copyright (c) 2026 NewNetGuard
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[Unit]
+Description=Install Chameleon fail-closed guards before networking
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target network.target network-online.target
+Before=chameleon-dns.service chameleon-resume.service chameleon-panel.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/chameleon/chameleon-runner chameleon-netctl guard
+RemainAfterExit=yes
+UMask=0077
+
+[Install]
+WantedBy=network-pre.target

@@ -1,0 +1,69 @@
+#!/bin/bash
+# Copyright (c) 2026 NewNetGuard
+# SPDX-License-Identifier: MPL-2.0
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+# chameleon-panel-firewall: keep the panel port closed to everything but the
+# local network, independently of the panel's own address check.
+#
+#   apply   accept the panel port from loopback and private ranges, drop the rest
+#   remove  delete the rules again
+#
+# The port comes from CHAMELEON_PANEL_PORT (/etc/chameleon/panel.env), 8443
+# by default. The rules sit at the head of INPUT, ahead of any host firewall.
+set -euo pipefail
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+CHAIN="CHAMELEON_PANEL"
+PORT="${CHAMELEON_PANEL_PORT:-8443}"
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || {
+  echo "invalid panel port: $PORT" >&2
+  exit 1
+}
+
+remove_chain() {
+  local tool="$1" line
+  local -a rule=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r -a rule <<< "${line/#-A /-D }"
+    "$tool" "${rule[@]}" 2>/dev/null || true
+  done < <("$tool" -S INPUT 2>/dev/null | grep -E -- "-j ${CHAIN}$" || true)
+  "$tool" -F "$CHAIN" 2>/dev/null || true
+  "$tool" -X "$CHAIN" 2>/dev/null || true
+}
+
+apply_chain() {
+  local tool="$1" net
+  shift
+  remove_chain "$tool"
+  "$tool" -N "$CHAIN"
+  "$tool" -A "$CHAIN" -i lo -j RETURN
+  for net in "$@"; do
+    "$tool" -A "$CHAIN" -s "$net" -j RETURN
+  done
+  "$tool" -A "$CHAIN" -j DROP
+  "$tool" -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN"
+}
+
+case "${1:-}" in
+  apply)
+    apply_chain iptables 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16
+    if command -v ip6tables >/dev/null 2>&1; then
+      apply_chain ip6tables fc00::/7 fe80::/10
+    fi
+    ;;
+  remove)
+    remove_chain iptables
+    if command -v ip6tables >/dev/null 2>&1; then
+      remove_chain ip6tables
+    fi
+    ;;
+  *)
+    echo "usage: chameleon-panel-firewall apply|remove" >&2
+    exit 1
+    ;;
+esac
