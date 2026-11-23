@@ -34,6 +34,6 @@
   <rect x="415" y="236" width="130" height="44" rx="8" fill="#ffffff" stroke="#bc4c00" stroke-dasharray="5 4"/>
   <text x="480" y="263" text-anchor="middle" fill="#bc4c00" font-weight="600">Censor / DPI</text>
   <line x1="480" y1="236" x2="480" y2="160" stroke="#bc4c00" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#a)"/>
-  <text x="492" y="206" fill="#bc4c00" font-style="italic">sees: Chrome browsing a website</text>
+  <text x="480" y="80" text-anchor="middle" fill="#bc4c00" font-style="italic">sees: Chrome browsing a website</text>
   </g>
 </svg>
