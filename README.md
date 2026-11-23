@@ -69,18 +69,10 @@ rent. There is no third-party service in between.
 
 ## How it works
 
-```mermaid
-flowchart LR
-    subgraph PC["Your computer"]
-        A["Applications"] --> T["Chameleon<br/>kill switch · DNS · TCP streams"]
-    end
-    T == "one HTTPS connection<br/>Chrome TLS 1.3 + HTTP/2" ==> N
-    subgraph VPS["Your VPS"]
-        N["nginx :443<br/>real certificate + cover website"] --> S["chameleon-server"]
-    end
-    S --> I(("Internet"))
-    O["Censor / DPI"] -. "sees: Chrome browsing a website" .-> T
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+  <img src="docs/images/how-it-works-light.svg" width="100%" alt="Applications on your computer go through Chameleon, which carries everything inside one HTTPS connection that looks like Chrome TLS 1.3 and HTTP/2. On your VPS, nginx on port 443 with a real certificate and a cover website hands the tunnel to chameleon-server, which connects to the internet. A censor watching the connection sees Chrome browsing a website.">
+</picture>
 
 1. Applications on your computer use the network as usual.
 2. Chameleon takes every connection: TCP connections become separate streams,
