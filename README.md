@@ -84,6 +84,37 @@ rent. There is no third-party service in between.
 
 The full protocol is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Screenshots
+
+The Chameleon panel. Server addresses, keys and logs are hidden.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/panel-client.png" alt="Client tab: connection status, server address and transport"></td>
+    <td width="50%"><img src="docs/screenshots/panel-client-security.png" alt="Client tab: server key, PSK, DoH fallback and advanced settings"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Client</b> — connection and transport</td>
+    <td align="center"><b>Client</b> — keys and advanced settings</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/panel-server.png" alt="Server tab: SSH connection to the VPS"></td>
+    <td width="50%"><img src="docs/screenshots/panel-server-domain.png" alt="Server tab: deployment, Domain HTTPS and deployment log"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Server</b> — SSH connection to the VPS</td>
+    <td align="center"><b>Server</b> — deployment and Domain HTTPS</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/panel-profile.png" alt="Profile tab: live connection state, traffic and runtime log"></td>
+    <td width="50%"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Profile</b> — live connection state</td>
+    <td></td>
+  </tr>
+</table>
+
 ## Quick start
 
 You need a VPS (see [Requirements](#requirements)) and the release package for
